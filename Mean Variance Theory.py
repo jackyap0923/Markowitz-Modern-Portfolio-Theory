@@ -15,9 +15,18 @@ class Markowitz():
     """ Uses data from the module yfinance to obtain closing prices and compute the geometric average. Geometric returns are then used
         to obtain the covariance matrix, variace and correlation matrix. Default for period and interval
         is 5 years with interval of 1d. Assuming we have 252 days per year we multiply by 252 to obtain the annualized values
+
+        Returns:
+        expected_arithmetic_returns: expected arithmetic returns of each asset per year in %
+        cov_matrix: covariance and variance per year
+        portfolio_returns: returns of the portfolio for each day in %
+        portfolio_variance: variance of the portfolio in %
+        proportions: proportions invested in each asset
     """
     def asset_summaries(self,period='5y',interval='1d'):
         ticker = self.ticker
+        price = self.price
+        quantity = self.quantity
         ticker_prices  = yf.download(ticker, period=str(period), interval= str(interval))
         closing_prices = (ticker_prices.Close).to_numpy()
         
@@ -29,28 +38,35 @@ class Markowitz():
                 returns_matrix[j,i] = (prices_[j+1] - prices_[j])/prices_[j]*100
 
         returns_df = pd.DataFrame(returns_matrix)
-
-        expected_arithmetic_returns = returns_df.mean(axis=0)*252
-        cov_matrix = returns_df.cov()*252
-        variance = returns_df.var()*252
-        correlation_matrix = returns_df.corr()
-
-        return (expected_arithmetic_returns,variance,cov_matrix,correlation_matrix,returns_df) 
-
-    """Calculates the Beta of any market or asset if ticker available in yahoo finance."""
-    def beta(self,period='5y',interval='1d',market ='SPY'):
-        # Calculates the proportions invested in each asset and defining variables
-        price = self.price
-        quantity = self.quantity
-        returns_matrix = self.asset_summaries(period,interval)[4].to_numpy()
+        returns_matrix = returns_df.to_numpy()
+        #Proportions invested in each asset
         capital_invested = np.dot(price,quantity)
         n = len(price)
         proportions = np.zeros((n,1))
         for i in range(n):
-            proportions[i] = price[i]*quantity[i]/capital_invested
+            proportions[i,0] = price[i]*quantity[i]/capital_invested
         
         #Obtaining market closing prices 
-        market_portfolio_prices = yf.download(market,period,interval).Close
+        #Calculating expected returns of portfolio based on closing prices
+        expected_arithmetic_returns = returns_df.mean(axis=0)*252
+        cov_matrix = returns_df.cov()*252
+        portfolio_returns = returns_matrix @ proportions 
+        portfolio_variance = proportions.T @ cov_matrix @ proportions
+
+        return (expected_arithmetic_returns,cov_matrix,portfolio_returns,portfolio_variance[0],returns_df,proportions) 
+
+    """Calculates the Beta of any market or asset if ticker available in yahoo finance.
+
+        Returns:
+        beta: beta of the market portfolio
+    """
+    def beta(self,period='5y',interval='1d',market ='SPY'):
+        # Calculates the proportions invested in each asset and defining variables
+        returns_matrix = self.asset_summaries(period,interval)[4].to_numpy()
+        proportions = self.asset_summaries(period,interval)[5]
+        
+        #Obtaining market closing prices 
+        market_portfolio_prices = yf.download(market,period=period,interval=interval).Close
         #Calculating expected returns of portfolio based on closing prices
         portfolio_returns = returns_matrix @ proportions
         #-1 indicates the size of the dimension should be inferred from the length of the array of the specified dimensions
@@ -61,10 +77,32 @@ class Markowitz():
         var_market_returns = np.var(market_returns.squeeze())
         beta = cov_market_returns/var_market_returns
 
-        
         return(beta)
+    
+    """
+    Sharpe Ratio = E[R_p - r_f]/sigma_p
+    Assuming risk free rate is constant, we have (E[R_p] - r_f)/sigma_p
 
-    """Market Returns = Returns from S&P 500 as defaut. Obtains latest interest rate based on the period to calculate capm expected returns"""
+    Returns:
+    sharpe: Sharpe Ratio
+    """
+    def sharpe_ratio(self,period='5y',interval='1d'):
+        portfolio_return = self.asset_summaries()[2]
+        portfolio_sd = np.sqrt(self.asset_summaries()[3])[0]
+        expected_portfolio_returns = np.sum(portfolio_return)/len(portfolio_return) *252
+        if period == '5y':
+            risk_free_rate = yf.download("^IRX",period='1d',interval='1d').Close #5 year treasury bond
+        elif period != '5y':
+            risk_free_rate = yf.download("^FVX",period='1d',interval='1d').Close #13 week treasury bill
+        sharpe = (expected_portfolio_returns - risk_free_rate[0])/portfolio_sd
+
+        return(sharpe)
+
+    """Market Returns = Returns from S&P 500 as defaut. Obtains latest interest rate based on the period to calculate capm expected returns
+
+    Return:
+    expected_portfolio_return: CAPM expected return of the portfolio in %    
+    """
     def capm_expected_return(self,period='5y',interval='1d', market='SPY'):
         beta = self.beta(period,interval,market)
         market_portfolio_prices = yf.download(market,period,interval).Close
@@ -80,25 +118,31 @@ class Markowitz():
         return(expected_portfolio_return)
     
 
-    """Assuming all factors are independent and equal weights in factors, and calculates the expected returns based on the factors. Default factors
-        and asset is S&P500 and Tesla respectively.
+    """Assuming all factors are independent and equal weights in factors, and calculates the expected returns based on the factors.
+    
+    Return:
+    alpha: excess returns of the portfolio in %
+    beta: coefficients of each of the factors
     """
-    def market_index_returns(self,period='5y',interval='1d',factors=['SPY'],asset='TSLA'):
-        asset_price = yf.download(asset,period=str(period),interval=str(interval)).Close
+    def alpha_returns(self,period='5y',interval='1d',factors=['SPY']):
+        portfolio_returns = self.asset_summaries()[2]
         factors_prices = yf.download(factors, period=str(period), interval= str(interval)).Close
-        n = factors_prices.shape[1]
+        n = len(factors)
 
-        #For Training for linear regression
-        asset_returns = (asset_price.pct_change().dropna()*100).to_numpy().reshape((-1,1))
-        factor_returns = (factors_prices.pct_change().dropna()*100).to_numpy().reshape((-1,n))
+        if period == '5y':
+            risk_free_rate = yf.download("^IRX",period='1d',interval='1d').Close #5 year treasury bond
+        elif period != '5y':
+            risk_free_rate = yf.download("^FVX",period='1d',interval='1d').Close #13 week treasury bill
         
-        expected_factor_returns = factor_returns.mean(axis=0)*252
+        #For Training for linear regression
+        factor_returns = (factors_prices.pct_change().dropna()*100).to_numpy().reshape((-1,n)) - risk_free_rate.iloc[0]
 
         #Obtain the coefficients of each factor and calculate the expected returns for asset
-        model = LinearRegression().fit(factor_returns,asset_returns)
-        expected_asset_return = (expected_factor_returns @ model.coef_.T + model.intercept_)[0]
+        model = LinearRegression().fit(factor_returns,portfolio_returns-risk_free_rate.iloc[0])
+        alpha = model.intercept_
+        beta = model.coef_
+        return(alpha,beta)
 
-        return(expected_asset_return)
 
 class MVT(Markowitz):
     """Period and intervals for obtaining closing prices"""
@@ -107,11 +151,17 @@ class MVT(Markowitz):
         self.n = len(ticker)
         self.period = period
         self.interval = interval
-        self.cov_matrix = self.asset_summaries(period,interval)[2]
+        self.cov_matrix = self.asset_summaries(period,interval)[1]
         self.asset_returns = np.array([self.asset_summaries(period,interval)[0]]).T #asset expected returns
         self.one_vector = np.ones((self.n,1))
         
-    """Minimum Variance Portfolio"""
+    """Minimum Variance Portfolio
+    
+    Return:
+    porfolio: proportions invested in each asset in our portfolio
+    portfolio_std: sigma of our minimum variance portfolio
+    portfolio_return: return of our minimum variance portfolio
+    """
     def min_var(self):
         n = self.n
         cov_matrix = self.cov_matrix
@@ -131,7 +181,12 @@ class MVT(Markowitz):
 
         return(portfolio, portfolio_std[0], portfolio_return[0,0])
     
-    """Minimum variance portfolio wiht constraint on expected return"""
+    """Minimum variance portfolio wiht constraint on expected return. Do not need to return portfolio_return as return of portfolio is constraint.
+    
+    Return:
+    portfolio: proportions of minimum variance portfolio with constraint on expected return
+    portfolio_std: sigma of our minimum variance portfolio with constraint on expected return
+    """
     def min_var_return(self,expected_return):
         n = self.n
         cov_matrix = self.cov_matrix
@@ -149,14 +204,20 @@ class MVT(Markowitz):
         portfolio_std = np.sqrt(portfolio.T @ cov_matrix @ portfolio)
         return(portfolio, portfolio_std[0])
     
-    """Composition of Tangent Portfolio wiht risk-freee rate determined by the period of investment"""
+    """Composition of Tangent Portfolio wiht risk-freee rate determined by the period of investment
+    
+    Return:
+    tangent_portfolio: proportions invested in the tangent portfolio of efficient frontier
+    portfolio_return: return on tangent portfolio
+    portfolio_std: sigma of tangent portfolio
+    """
     def tangent_portfolio(self):
         period = self.period
         if period == '5y':
             risk_free_rate = yf.download("^IRX",period='1d',interval='1d').Close
         elif period != '5y':
             risk_free_rate = yf.download("^FVX",period='1d',interval='1d').Close
-        self
+
         asset_returns = self.asset_returns
         cov_matrix = self.cov_matrix
         constraint_matrix = np.array(asset_returns) - risk_free_rate[0]
@@ -168,7 +229,11 @@ class MVT(Markowitz):
 
         return(tangent_portfolio,portfolio_return[0],portfolio_std[0])
 
-    """n is the number of efficient portfolios to create the efficient frontier"""
+    """n is the number of efficient portfolios to create the efficient frontier
+    
+    Return:
+    plots the efficient frontier
+    """
     def efficient_frontier(self,no_of_points=1000): 
         period = self.period
         returns = np.arange(0,100,100/no_of_points)
@@ -205,5 +270,7 @@ class MVT(Markowitz):
         plt.ylabel('Expected Portfolio Return (%)')
         #Shows your portfolio
         plt.show()
+    
+    
     
     
